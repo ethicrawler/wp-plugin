@@ -415,8 +415,37 @@ class EthicrawlerBotDetector {
                             <?php endif; ?>
                         </td>
                     </tr>
+                    <tr>
+                        <td><strong><?php _e('Whitelisted Crawlers', 'ethicrawler-bot-detector'); ?></strong></td>
+                        <td>
+                            <?php echo esc_html(implode(', ', $this->whitelisted_bots)); ?>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><strong><?php _e('Backend Connection', 'ethicrawler-bot-detector'); ?></strong></td>
+                        <td>
+                            <?php 
+                            $backend_url = get_option('ethicrawler_backend_url', 'https://api.ethicrawler.com');
+                            if (!empty($backend_url)): ?>
+                                <span style="color: green;"><?php echo esc_html($backend_url); ?></span>
+                            <?php else: ?>
+                                <span style="color: red;"><?php _e('Not configured', 'ethicrawler-bot-detector'); ?></span>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
                 </tbody>
             </table>
+            
+            <h2><?php _e('Bot Detection Information', 'ethicrawler-bot-detector'); ?></h2>
+            <div class="notice notice-info">
+                <p><strong><?php _e('How it works:', 'ethicrawler-bot-detector'); ?></strong></p>
+                <ul>
+                    <li><?php _e('The plugin monitors all page requests for AI bot activity', 'ethicrawler-bot-detector'); ?></li>
+                    <li><?php _e('Legitimate search engine crawlers are automatically whitelisted and not logged', 'ethicrawler-bot-detector'); ?></li>
+                    <li><?php _e('AI bots and scrapers are detected and their activity is logged to the backend', 'ethicrawler-bot-detector'); ?></li>
+                    <li><?php _e('All API calls are non-blocking to ensure your site performance is not affected', 'ethicrawler-bot-detector'); ?></li>
+                </ul>
+            </div>
         </div>
         <?php
     }
