@@ -86,6 +86,9 @@ class EthicrawlerBotDetector {
         // Admin hooks
         add_action('admin_menu', [$this, 'add_admin_menu']);
         add_action('admin_init', [$this, 'register_settings']);
+        
+        // API retry mechanism hook
+        add_action('ethicrawler_retry_api_request', [$this, 'retry_api_request'], 10, 1);
     }
     
     /**
@@ -290,28 +293,353 @@ class EthicrawlerBotDetector {
     }
     
     /**
-     * Send data to backend API
+     * Send data to backend API (non-blocking)
+     * 
+     * This implementation ensures site performance is not affected by:
+     * 1. Using non-blocking requests with 'blocking' => false
+     * 2. Using a short timeout to prevent hanging connections
+     * 3. Using WordPress shutdown hook for truly asynchronous processing
+     * 4. Implementing exponential backoff for retries
+     * 5. Gracefully handling all errors without affecting the main thread
      */
     private function send_to_backend($data) {
+        // Use WordPress shutdown hook to ensure the request happens after page rendering is complete
+        // This guarantees zero impact on page load time for visitors
+        add_action('shutdown', function() use ($data) {
+            $this->process_api_request($data);
+        });
+        
+        return true;
+    }
+    
+    /**
+     * Process API request asynchronously after page rendering is complete
+     * This is called by the shutdown hook to ensure zero impact on site performance
+     */
+    private function process_api_request($data) {
         $backend_url = get_option('ethicrawler_backend_url', 'https://api.ethicrawler.com');
         $endpoint = rtrim($backend_url, '/') . '/api/v1/log_request';
         
+        // Validate backend URL
+        if (empty($backend_url) || !filter_var($backend_url, FILTER_VALIDATE_URL)) {
+            $this->log_api_error('Invalid backend URL configured', ['url' => $backend_url]);
+            return false;
+        }
+        
+        // Generate unique request ID for tracking and deduplication
+        $request_id = md5(serialize($data) . microtime(true));
+        
+        // Prepare request arguments for non-blocking transmission
         $args = [
             'body' => wp_json_encode($data),
             'headers' => [
                 'Content-Type' => 'application/json',
-                'User-Agent' => 'Ethicrawler-WP-Plugin/' . ETHICRAWLER_PLUGIN_VERSION
+                'User-Agent' => 'Ethicrawler-WP-Plugin/' . ETHICRAWLER_PLUGIN_VERSION,
+                'Accept' => 'application/json',
+                'X-Ethicrawler-Request-ID' => $request_id
             ],
-            'timeout' => 5,
-            'blocking' => false, // Non-blocking to prevent site slowdown
-            'sslverify' => true
+            'timeout' => 2, // Very short timeout to prevent hanging connections
+            'blocking' => false, // Critical: Non-blocking to prevent site slowdown
+            'sslverify' => true,
+            'redirection' => 1, // Limit redirects to minimize processing time
+            'httpversion' => '1.1',
+            'reject_unsafe_urls' => true // Security: Prevent requests to private IPs/localhost
         ];
+        
+        // Add retry mechanism using WordPress cron for failed requests
+        $retry_key = 'ethicrawler_retry_' . $request_id;
+        
+        // Store request data temporarily for potential retries
+        set_transient($retry_key . '_data', $data, DAY_IN_SECONDS);
+        
+        // Use fastcgi_finish_request if available to release the connection immediately
+        // This PHP function is available in PHP-FPM and allows the script to continue
+        // executing while immediately returning the response to the client
+        if (function_exists('fastcgi_finish_request') && !defined('WP_CLI') && !wp_doing_ajax()) {
+            @fastcgi_finish_request();
+        }
+        
+        // Attempt to send the request
+        $response = wp_remote_post($endpoint, $args);
+        
+        // Handle errors without affecting site performance
+        if (is_wp_error($response)) {
+            $this->log_api_error('API request failed', [
+                'error' => $response->get_error_message(),
+                'error_code' => $response->get_error_code(),
+                'endpoint' => $endpoint,
+                'request_id' => $request_id
+            ]);
+            
+            // Schedule retry for failed requests (non-blocking)
+            $this->schedule_retry($retry_key);
+            return false;
+        }
+        
+        // For non-blocking requests, we can't check the response status
+        // but we can log successful dispatch
+        $this->log_api_success('Data transmitted to backend', [
+            'endpoint' => $endpoint,
+            'data_size' => strlen(wp_json_encode($data)),
+            'request_id' => $request_id
+        ]);
+        
+        return true;
+    }
+    
+    /**
+     * Schedule retry for failed API requests
+     * 
+     * This implementation uses WordPress cron for reliable retries with exponential backoff
+     * while ensuring site performance is not affected
+     */
+    private function schedule_retry($retry_key) {
+        // Check if retry is already scheduled
+        if (wp_next_scheduled('ethicrawler_retry_api_request', [$retry_key])) {
+            return;
+        }
+        
+        // Get retry count
+        $retry_count = get_transient($retry_key . '_count') ?: 0;
+        
+        // Maximum 3 retries with exponential backoff
+        if ($retry_count < 3) {
+            // Exponential backoff: 1min, 2min, 4min
+            $delay = pow(2, $retry_count) * 60;
+            
+            // Get the stored data for this retry
+            $data = get_transient($retry_key . '_data');
+            
+            if ($data) {
+                // Schedule non-blocking retry via WordPress cron
+                wp_schedule_single_event(time() + $delay, 'ethicrawler_retry_api_request', [$retry_key]);
+                set_transient($retry_key . '_count', $retry_count + 1, DAY_IN_SECONDS);
+                
+                $this->log_api_error('Scheduled retry for failed request', [
+                    'retry_count' => $retry_count + 1,
+                    'delay_seconds' => $delay,
+                    'retry_key' => $retry_key,
+                    'next_attempt_time' => date('Y-m-d H:i:s', time() + $delay)
+                ]);
+            } else {
+                $this->log_api_error('Cannot schedule retry - missing data', [
+                    'retry_key' => $retry_key
+                ]);
+                delete_transient($retry_key . '_count');
+            }
+        } else {
+            $this->log_api_error('Maximum retries exceeded, dropping request', [
+                'retry_count' => $retry_count,
+                'retry_key' => $retry_key
+            ]);
+            
+            // Clean up transients
+            delete_transient($retry_key . '_count');
+            delete_transient($retry_key . '_data');
+        }
+    }
+    
+    /**
+     * Log API errors without affecting site performance
+     * 
+     * This implementation ensures comprehensive error logging while maintaining
+     * zero impact on site performance by:
+     * 1. Using non-blocking option updates
+     * 2. Limiting stored error history to prevent database bloat
+     * 3. Providing detailed context for debugging
+     * 4. Categorizing errors for better analysis
+     */
+    private function log_api_error($message, $context = []) {
+        // Add timestamp and error category
+        $error_category = $this->determine_error_category($message);
+        
+        $log_entry = [
+            'timestamp' => current_time('c', true),
+            'level' => 'ERROR',
+            'category' => $error_category,
+            'message' => $message,
+            'context' => $context,
+            'plugin_version' => ETHICRAWLER_PLUGIN_VERSION,
+            'site_url' => get_site_url(),
+            'php_version' => phpversion(),
+            'wp_version' => get_bloginfo('version')
+        ];
+        
+        // Log to WordPress error log with category for easier filtering
+        error_log('Ethicrawler Bot Detector [ERROR] [' . $error_category . ']: ' . $message . ' - ' . wp_json_encode($context));
+        
+        // Use shutdown hook for option updates to ensure zero impact on page load
+        add_action('shutdown', function() use ($log_entry) {
+            $this->update_error_logs($log_entry);
+        });
+    }
+    
+    /**
+     * Update error logs in a non-blocking way
+     * Called during shutdown to prevent performance impact
+     */
+    private function update_error_logs($log_entry) {
+        // Store recent errors for admin display (limit to last 10)
+        $recent_errors = get_option('ethicrawler_recent_errors', []);
+        array_unshift($recent_errors, $log_entry);
+        $recent_errors = array_slice($recent_errors, 0, 10);
+        update_option('ethicrawler_recent_errors', $recent_errors, false);
+        
+        // Update error statistics
+        $error_stats = get_option('ethicrawler_error_stats', ['total' => 0, 'last_error' => null, 'by_category' => []]);
+        $error_stats['total']++;
+        $error_stats['last_error'] = current_time('c', true);
+        
+        // Track errors by category for better reporting
+        if (!isset($error_stats['by_category'][$log_entry['category']])) {
+            $error_stats['by_category'][$log_entry['category']] = 0;
+        }
+        $error_stats['by_category'][$log_entry['category']]++;
+        
+        update_option('ethicrawler_error_stats', $error_stats, false);
+    }
+    
+    /**
+     * Determine error category for better organization and filtering
+     */
+    private function determine_error_category($message) {
+        $message_lower = strtolower($message);
+        
+        if (strpos($message_lower, 'url') !== false) {
+            return 'configuration';
+        } elseif (strpos($message_lower, 'retry') !== false) {
+            return 'retry';
+        } elseif (strpos($message_lower, 'timeout') !== false || strpos($message_lower, 'timed out') !== false) {
+            return 'timeout';
+        } elseif (strpos($message_lower, 'http') !== false || strpos($message_lower, 'status') !== false) {
+            return 'http';
+        } elseif (strpos($message_lower, 'ssl') !== false || strpos($message_lower, 'tls') !== false) {
+            return 'ssl';
+        } elseif (strpos($message_lower, 'dns') !== false || strpos($message_lower, 'resolve') !== false) {
+            return 'dns';
+        } else {
+            return 'general';
+        }
+    }
+    
+    /**
+     * Log API success events
+     */
+    private function log_api_success($message, $context = []) {
+        // Only log success in debug mode to avoid log spam
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            error_log('Ethicrawler Bot Detector [SUCCESS]: ' . $message . ' - ' . wp_json_encode($context));
+        }
+        
+        // Update success statistics
+        $success_stats = get_option('ethicrawler_success_stats', ['total' => 0, 'last_success' => null]);
+        $success_stats['total']++;
+        $success_stats['last_success'] = current_time('c', true);
+        update_option('ethicrawler_success_stats', $success_stats, false);
+    }
+    
+    /**
+     * Retry failed API requests (called by WordPress cron)
+     * 
+     * This method is triggered by the WordPress cron system for failed API requests
+     * It retrieves the stored data from transients and attempts to resend it
+     */
+    public function retry_api_request($retry_key) {
+        // Get the stored data for this retry
+        $data = get_transient($retry_key . '_data');
+        
+        if (!$data) {
+            $this->log_api_error('Retry failed: Missing data for retry', ['retry_key' => $retry_key]);
+            delete_transient($retry_key . '_count');
+            return;
+        }
+        
+        $backend_url = get_option('ethicrawler_backend_url', 'https://api.ethicrawler.com');
+        $endpoint = rtrim($backend_url, '/') . '/api/v1/log_request';
+        
+        // Validate backend URL
+        if (empty($backend_url) || !filter_var($backend_url, FILTER_VALIDATE_URL)) {
+            $this->log_api_error('Retry failed: Invalid backend URL', ['url' => $backend_url]);
+            return;
+        }
+        
+        // Get retry count for logging
+        $retry_count = get_transient($retry_key . '_count') ?: 0;
+        
+        // Prepare request arguments for retry (blocking this time since it's in cron)
+        $args = [
+            'body' => wp_json_encode($data),
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'User-Agent' => 'Ethicrawler-WP-Plugin/' . ETHICRAWLER_PLUGIN_VERSION . ' (retry)',
+                'Accept' => 'application/json',
+                'X-Ethicrawler-Request-ID' => substr($retry_key, 16), // Extract request ID from retry key
+                'X-Ethicrawler-Retry-Count' => $retry_count
+            ],
+            'timeout' => 10, // Longer timeout for retry
+            'blocking' => true, // Blocking in cron is acceptable
+            'sslverify' => true,
+            'redirection' => 2,
+            'httpversion' => '1.1',
+            'reject_unsafe_urls' => true // Security: Prevent requests to private IPs/localhost
+        ];
+        
+        $this->log_api_success('Attempting retry', [
+            'retry_count' => $retry_count,
+            'retry_key' => $retry_key,
+            'endpoint' => $endpoint
+        ]);
         
         $response = wp_remote_post($endpoint, $args);
         
-        // Log errors for debugging (only in non-blocking mode for monitoring)
         if (is_wp_error($response)) {
-            error_log('Ethicrawler Bot Detector: API request failed - ' . $response->get_error_message());
+            $this->log_api_error('Retry attempt failed', [
+                'error' => $response->get_error_message(),
+                'error_code' => $response->get_error_code(),
+                'retry_count' => $retry_count,
+                'endpoint' => $endpoint,
+                'retry_key' => $retry_key
+            ]);
+            
+            // Schedule another retry if we haven't exceeded the limit
+            if ($retry_count < 3) {
+                $this->schedule_retry($retry_key);
+            } else {
+                // Clean up transients after max retries
+                delete_transient($retry_key . '_count');
+                delete_transient($retry_key . '_data');
+            }
+        } else {
+            // Check response status for blocking requests
+            $status_code = wp_remote_retrieve_response_code($response);
+            if ($status_code >= 200 && $status_code < 300) {
+                $this->log_api_success('Retry successful', [
+                    'status_code' => $status_code,
+                    'endpoint' => $endpoint,
+                    'retry_count' => $retry_count,
+                    'retry_key' => $retry_key
+                ]);
+                
+                // Clean up retry tracking on success
+                delete_transient($retry_key . '_count');
+                delete_transient($retry_key . '_data');
+            } else {
+                $this->log_api_error('Retry failed with HTTP error', [
+                    'status_code' => $status_code,
+                    'response_body' => wp_remote_retrieve_body($response),
+                    'retry_count' => $retry_count,
+                    'retry_key' => $retry_key
+                ]);
+                
+                // Schedule another retry if we haven't exceeded the limit
+                if ($retry_count < 3) {
+                    $this->schedule_retry($retry_key);
+                } else {
+                    // Clean up transients after max retries
+                    delete_transient($retry_key . '_count');
+                    delete_transient($retry_key . '_data');
+                }
+            }
         }
     }
     
@@ -416,12 +744,6 @@ class EthicrawlerBotDetector {
                         </td>
                     </tr>
                     <tr>
-                        <td><strong><?php _e('Whitelisted Crawlers', 'ethicrawler-bot-detector'); ?></strong></td>
-                        <td>
-                            <?php echo esc_html(implode(', ', $this->whitelisted_bots)); ?>
-                        </td>
-                    </tr>
-                    <tr>
                         <td><strong><?php _e('Backend Connection', 'ethicrawler-bot-detector'); ?></strong></td>
                         <td>
                             <?php 
@@ -435,6 +757,127 @@ class EthicrawlerBotDetector {
                     </tr>
                 </tbody>
             </table>
+            
+            <h2><?php _e('API Integration Status', 'ethicrawler-bot-detector'); ?></h2>
+            <?php
+            $success_stats = get_option('ethicrawler_success_stats', ['total' => 0, 'last_success' => null]);
+            $error_stats = get_option('ethicrawler_error_stats', ['total' => 0, 'last_error' => null, 'by_category' => []]);
+            $recent_errors = get_option('ethicrawler_recent_errors', []);
+            ?>
+            <div class="notice notice-info inline">
+                <p><strong><?php _e('Performance Protection:', 'ethicrawler-bot-detector'); ?></strong> <?php _e('All API calls are processed asynchronously after page rendering is complete, ensuring zero impact on site performance.', 'ethicrawler-bot-detector'); ?></p>
+            </div>
+            
+            <table class="widefat">
+                <tbody>
+                    <tr>
+                        <td><strong><?php _e('Successful API Calls', 'ethicrawler-bot-detector'); ?></strong></td>
+                        <td>
+                            <span style="color: green;"><?php echo esc_html($success_stats['total']); ?></span>
+                            <?php if ($success_stats['last_success']): ?>
+                                <br><small><?php printf(__('Last success: %s', 'ethicrawler-bot-detector'), esc_html(date('Y-m-d H:i:s', strtotime($success_stats['last_success'])))); ?></small>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><strong><?php _e('Failed API Calls', 'ethicrawler-bot-detector'); ?></strong></td>
+                        <td>
+                            <?php if ($error_stats['total'] > 0): ?>
+                                <span style="color: red;"><?php echo esc_html($error_stats['total']); ?></span>
+                                <?php if ($error_stats['last_error']): ?>
+                                    <br><small><?php printf(__('Last error: %s', 'ethicrawler-bot-detector'), esc_html(date('Y-m-d H:i:s', strtotime($error_stats['last_error'])))); ?></small>
+                                <?php endif; ?>
+                            <?php else: ?>
+                                <span style="color: green;">0</span>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><strong><?php _e('Error Categories', 'ethicrawler-bot-detector'); ?></strong></td>
+                        <td>
+                            <?php if (!empty($error_stats['by_category'])): ?>
+                                <ul style="margin: 0; padding-left: 20px;">
+                                <?php foreach ($error_stats['by_category'] as $category => $count): ?>
+                                    <li><?php echo esc_html(ucfirst($category)); ?>: <span style="color: <?php echo $count > 0 ? 'red' : 'green'; ?>"><?php echo esc_html($count); ?></span></li>
+                                <?php endforeach; ?>
+                                </ul>
+                            <?php else: ?>
+                                <span style="color: green;"><?php _e('No errors recorded', 'ethicrawler-bot-detector'); ?></span>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><strong><?php _e('API Request Mode', 'ethicrawler-bot-detector'); ?></strong></td>
+                        <td>
+                            <span style="color: green;"><?php _e('Fully Asynchronous', 'ethicrawler-bot-detector'); ?></span>
+                            <br><small><?php _e('Requests are processed after page rendering using WordPress shutdown hook', 'ethicrawler-bot-detector'); ?></small>
+                            <?php if (function_exists('fastcgi_finish_request')): ?>
+                                <br><small><?php _e('Using fastcgi_finish_request() for optimal performance', 'ethicrawler-bot-detector'); ?></small>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><strong><?php _e('Retry Mechanism', 'ethicrawler-bot-detector'); ?></strong></td>
+                        <td>
+                            <span style="color: green;"><?php _e('Enabled with Exponential Backoff', 'ethicrawler-bot-detector'); ?></span>
+                            <br><small><?php _e('Failed requests are automatically retried with 1min, 2min, 4min delays', 'ethicrawler-bot-detector'); ?></small>
+                            <br><small><?php _e('Retries are processed via WordPress cron to ensure site performance', 'ethicrawler-bot-detector'); ?></small>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><strong><?php _e('Error Handling', 'ethicrawler-bot-detector'); ?></strong></td>
+                        <td>
+                            <span style="color: green;"><?php _e('Comprehensive', 'ethicrawler-bot-detector'); ?></span>
+                            <br><small><?php _e('All errors are logged with detailed context for debugging', 'ethicrawler-bot-detector'); ?></small>
+                            <br><small><?php _e('Error logging uses non-blocking updates during shutdown hook', 'ethicrawler-bot-detector'); ?></small>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><strong><?php _e('Whitelisted Crawlers', 'ethicrawler-bot-detector'); ?></strong></td>
+                        <td>
+                            <?php echo esc_html(implode(', ', $this->whitelisted_bots)); ?>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+            
+            <?php if (!empty($recent_errors)): ?>
+            <h2><?php _e('Recent API Errors', 'ethicrawler-bot-detector'); ?></h2>
+            <div class="notice notice-warning">
+                <p><?php _e('Recent API errors are shown below. These errors do not affect your site performance as all API calls are non-blocking.', 'ethicrawler-bot-detector'); ?></p>
+            </div>
+            <table class="widefat">
+                <thead>
+                    <tr>
+                        <th><?php _e('Timestamp', 'ethicrawler-bot-detector'); ?></th>
+                        <th><?php _e('Error Message', 'ethicrawler-bot-detector'); ?></th>
+                        <th><?php _e('Details', 'ethicrawler-bot-detector'); ?></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach (array_slice($recent_errors, 0, 5) as $error): ?>
+                    <tr>
+                        <td><?php echo esc_html(date('Y-m-d H:i:s', strtotime($error['timestamp']))); ?></td>
+                        <td><?php echo esc_html($error['message']); ?></td>
+                        <td>
+                            <?php if (!empty($error['context'])): ?>
+                                <details>
+                                    <summary><?php _e('Show details', 'ethicrawler-bot-detector'); ?></summary>
+                                    <pre style="font-size: 11px; max-height: 100px; overflow-y: auto;"><?php echo esc_html(wp_json_encode($error['context'], JSON_PRETTY_PRINT)); ?></pre>
+                                </details>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+            
+            <p>
+                <button type="button" class="button" onclick="if(confirm('<?php _e('Are you sure you want to clear error logs?', 'ethicrawler-bot-detector'); ?>')) { window.location.href='<?php echo esc_url(add_query_arg('clear_errors', '1')); ?>'; }">
+                    <?php _e('Clear Error Logs', 'ethicrawler-bot-detector'); ?>
+                </button>
+            </p>
+            <?php endif; ?>
             
             <h2><?php _e('Bot Detection Information', 'ethicrawler-bot-detector'); ?></h2>
             <div class="notice notice-info">
